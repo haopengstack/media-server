@@ -234,32 +234,116 @@ int DTLSICETransport::onData(const ICERemoteCandidate* candidate,BYTE* data,DWOR
 	//Set the payload
 	packet->SetPayload(data+ini,len-ini);
 	
-	//Using incoming
-	ScopedUse use(incomingUse);
 	
-	//Get group
-	RTPIncomingSourceGroup *group = GetIncomingSourceGroup(ssrc);
-	
-	//If it doesn't have a group but does hava an rtp stream id
-	if (!group && extension.hasRId)
+	//Synchronized
+	RTPIncomingSourceGroup *group = nullptr;
 	{
-		Debug("-DTLSICETransport::onData() | Unknowing group for ssrc trying to retrieve by [ssrc:%u,rid:'%s']\n",ssrc,extension.rid.c_str());
-		//Try to find it on the rids
-		auto it = rids.find(extension.rid);
-		//If found
-		if (it!=rids.end())
+		//Lock incoming
+		ScopedUseLock lock(incomingUse);
+
+		//Get group
+		 group = GetIncomingSourceGroup(ssrc);
+
+		//If it doesn't have a group
+		if (!group)
 		{
-			Log("-DTLSICETransport::onData() | Associating rtp stream id to ssrc [ssrc:%u,rid:'%s']\n",ssrc,extension.rid.c_str());
-					
-			//Got source
-			group = it->second;
-			
-			//Set ssrc for next ones
-			//TODO: ensure it didn't had a previous ssrc
-			group->media.ssrc = ssrc;
-			
-			//Add it to the incoming list
-			incoming[group->media.ssrc] = group;
+			//Get rid
+			auto mid = extension.mid;
+			auto rid = extension.hasRepairedId ? extension.repairedId : extension.rid;
+
+			Debug("-DTLSICETransport::onData() | Unknowing group for ssrc trying to retrieve by [ssrc:%u,rid:'%s']\n",ssrc,extension.rid.c_str());
+
+			//If it is the repaidr stream or it has rid and it is rtx
+			if (extension.hasRepairedId || (extension.hasRId && packet->GetCodec()==VideoCodec::RTX))
+			{
+				//Try to find it on the rids and mids
+				auto it = rids.find(mid+"@"+rid);
+				//If found
+				if (it!=rids.end())
+				{
+					Log("-DTLSICETransport::onData() | Associating rtx stream to ssrc [ssrc:%u,mid:'%s',rid:'%s']\n",ssrc,mid.c_str(),rid.c_str());
+
+					//Got source
+					group = it->second;
+
+					//Check if there was a previous ssrc
+					if (group->rtx.ssrc)
+						//Remove previous one
+						incoming.erase(group->rtx.ssrc);
+
+					//Set ssrc for next ones
+					group->rtx.ssrc = ssrc;
+
+					//Add it to the incoming list
+					incoming[ssrc] = group;
+				}
+			} else if (extension.hasRId) {
+				//Try to find it on the rids and mids
+				auto it = rids.find(mid+"@"+rid);
+				//If found
+				if (it!=rids.end())
+				{
+					Log("-DTLSICETransport::onData() | Associating rtp stream to ssrc [ssrc:%u,mid:'%s',rid:'%s']\n",ssrc,mid.c_str(),rid.c_str());
+
+					//Got source
+					group = it->second;
+
+					//Check if there was a previous ssrc
+					if (group->media.ssrc)
+						//Remove previous one
+						incoming.erase(group->media.ssrc);
+
+					//Set ssrc for next ones
+					group->media.ssrc = ssrc;
+
+					//Add it to the incoming list
+					incoming[ssrc] = group;
+				}
+			} else if (extension.hasMediaStreamId && packet->GetCodec()==VideoCodec::RTX) {
+				//Try to find it on the rids and mids
+				auto it = mids.find(mid);
+				//If found
+				if (it!=mids.end())
+				{
+					Log("-DTLSICETransport::onData() | Associating rtx stream id to ssrc [ssrc:%u,mid:'%s']\n",ssrc,mid.c_str());
+
+					//Get first source in set, if there was more it should have contained an rid
+					group = *it->second.begin();
+
+					//Check if there was a previous ssrc
+					if (group->rtx.ssrc)
+						//Remove previous one
+						incoming.erase(group->rtx.ssrc);
+
+					//Set ssrc for next ones
+					group->rtx.ssrc = ssrc;
+
+					//Add it to the incoming list
+					incoming[ssrc] = group;
+				}
+			} else if (extension.hasMediaStreamId) {
+				//Try to find it on the rids and mids
+				auto it = mids.find(mid);
+				//If found
+				if (it!=mids.end())
+				{
+					Log("-DTLSICETransport::onData() | Associating rtp stream to ssrc [ssrc:%u,mid:'%s']\n",ssrc,mid.c_str());
+
+					//Get first source in set, if there was more it should have contained an rid
+					group = *it->second.begin();
+
+					//Check if there was a previous ssrc
+					if (group->media.ssrc)
+						//Remove previous one
+						incoming.erase(group->media.ssrc);
+
+					//Set ssrc for next ones
+					group->media.ssrc = ssrc;
+
+					//Add it to the incoming list
+					incoming[ssrc] = group;
+				}
+			}
 		}
 	}
 			
@@ -502,6 +586,8 @@ void DTLSICETransport::SendProbe(RTPOutgoingSourceGroup *group,BYTE padding)
 	//If it is using rtx (i.e. not firefox)
 	if (rtx)
 	{
+                //Lock in scope
+                ScopedLock scope(source);
 		//Update RTX headers
 		header.ssrc		= source.ssrc;
 		header.payloadType	= sendMaps.apt.begin()->first;
@@ -510,6 +596,8 @@ void DTLSICETransport::SendProbe(RTPOutgoingSourceGroup *group,BYTE padding)
 		//Padding
 		header.padding		= 1;
 	} else {
+                //Lock in scope
+                ScopedLock scope(source);
 		//Update normal headers
 		header.ssrc		= source.ssrc;
 		header.payloadType	= source.lastPayloadType;
@@ -608,12 +696,17 @@ void DTLSICETransport::SendProbe(RTPOutgoingSourceGroup *group,BYTE padding)
 		//Error
 		Error("-RTPTransport::SendPacket() | Error sending RTP packet [%d]\n",errno);
 	
-	//Update last send time
-	source.lastTime		= header.timestamp;
-	source.lastPayloadType  = header.payloadType;
+        //SYNC
+        {
+                //Lock in scope
+                ScopedLock scope(source);
+                //Update last send time
+                source.lastTime		= header.timestamp;
+                source.lastPayloadType  = header.payloadType;
 	
-	//Update stats
-	source.Update(getTimeMS(),header.sequenceNumber,len);
+                //Update stats
+                source.Update(getTimeMS(),header.sequenceNumber,len);
+        }
 	
 	//Add to transport wide stats
 	if (extension.hasTransportWideCC)
@@ -690,6 +783,8 @@ void DTLSICETransport::ReSendPacket(RTPOutgoingSourceGroup *group,WORD seq)
 	//If it is using rtx (i.e. not firefox)
 	if (rtx)
 	{
+                //Lock in scope
+                ScopedLock scope(source);
 		//Update RTX headers
 		header.ssrc		= source.ssrc;
 		header.payloadType	= apt;
@@ -797,12 +892,17 @@ void DTLSICETransport::ReSendPacket(RTPOutgoingSourceGroup *group,WORD seq)
 		//Error
 		Error("-RTPTransport::SendPacket() | Error sending RTP packet [%d]\n",errno);
 	
-	//Update last send time
-	source.lastTime		= packet->GetTimestamp();
-	source.lastPayloadType  = packet->GetPayloadType();
+        //Synchronized
+	{
+		//Block scope
+		ScopedLock scope(source);
+                //Update last send time
+                source.lastTime		= packet->GetTimestamp();
+                source.lastPayloadType  = packet->GetPayloadType();
 	
-	//Update stats
-	source.Update(getTimeMS(),header.sequenceNumber,len);
+                //Update stats
+                source.Update(getTimeMS(),header.sequenceNumber,len);
+        }
 	
 	//Add to transport wide stats
 	if (extension.hasTransportWideCC)
@@ -1471,7 +1571,7 @@ bool DTLSICETransport::RemoveOutgoingSourceGroup(RTPOutgoingSourceGroup *group)
 
 bool DTLSICETransport::AddIncomingSourceGroup(RTPIncomingSourceGroup *group)
 {
-	Log("-AddIncomingSourceGroup [mid:'%s',rid:'%s',,ssrc:%u,fec:%u,rtx:%u]\n",group->mid.c_str(),group->rid.c_str(),group->media.ssrc,group->fec.ssrc,group->rtx.ssrc);
+	Log("-AddIncomingSourceGroup [mid:'%s',rid:'%s',ssrc:%u,fec:%u,rtx:%u]\n",group->mid.c_str(),group->rid.c_str(),group->media.ssrc,group->fec.ssrc,group->rtx.ssrc);
 	
 	//It must contain media ssrc
 	if (!group->media.ssrc && group->rid.empty())
@@ -1490,7 +1590,7 @@ bool DTLSICETransport::AddIncomingSourceGroup(RTPIncomingSourceGroup *group)
 
 	//Add rid if any
 	if (!group->rid.empty())
-		rids[group->rid] = group;
+		rids[group->mid + "@" + group->rid] = group;
 	
 	//Add mid if any
 	if (!group->mid.empty())
@@ -1526,11 +1626,7 @@ bool DTLSICETransport::AddIncomingSourceGroup(RTPIncomingSourceGroup *group)
 
 bool DTLSICETransport::RemoveIncomingSourceGroup(RTPIncomingSourceGroup *group)
 {
-	Log("-RemoveIncomingSourceGroup [ssrc:%u,fec:%u,rtx:%u]\n",group->media.ssrc,group->fec.ssrc,group->rtx.ssrc);
-	
-	//It must contain media ssrc
-	if (!group->media.ssrc)
-		return Error("No media ssrc defined, stream will not be removed\n");
+	Log("-RemoveIncomingSourceGroup [mid:'%s',rid:'%s',ssrc:%u,fec:%u,rtx:%u]\n",group->mid.c_str(),group->rid.c_str(),group->media.ssrc,group->fec.ssrc,group->rtx.ssrc);
 	
 	//Stop distpaching
 	group->Stop();
@@ -1540,7 +1636,7 @@ bool DTLSICETransport::RemoveIncomingSourceGroup(RTPIncomingSourceGroup *group)
 
 	//Remove rid if any
 	if (!group->rid.empty())
-		rids.erase(group->rid);
+		rids.erase(group->mid + "@" + group->rid);
 	
 	//Remove mid if any
 	if (!group->rid.empty())
@@ -1714,9 +1810,15 @@ int DTLSICETransport::Send(const RTPPacket::shared& packet)
 	//Clone packet
 	auto cloned = packet->Clone();
 	
-	//Update headers
-	cloned->SetExtSeqNum(source.CorrectExtSeqNum(cloned->GetExtSeqNum()));
-	cloned->SetSSRC(source.ssrc);
+        //SYNCHRONIZED
+        {
+                //Block scope
+		ScopedLock scope(source);
+                //Update headers
+                cloned->SetExtSeqNum(source.CorrectExtSeqNum(cloned->GetExtSeqNum()));
+                cloned->SetSSRC(source.ssrc);
+        }
+        
 	cloned->SetPayloadType(sendMaps.rtp.GetTypeForCodec(cloned->GetCodec()));
 	//No padding
 	cloned->SetPadding(0);
@@ -1797,12 +1899,16 @@ int DTLSICETransport::Send(const RTPPacket::shared& packet)
 	//If got packet to send
 	if (len>0)
 	{
-		//Update last items
-		source.lastTime		= cloned->GetTimestamp();
-		source.lastPayloadType  = cloned->GetPayloadType();
+                {
+                        //Block scope
+                        ScopedLock scope(source);
+                        //Update last items
+                        source.lastTime		= cloned->GetTimestamp();
+                        source.lastPayloadType  = cloned->GetPayloadType();
 
-		//Update source
-		source.Update(getTimeMS(),cloned->GetSeqNum(),len);
+                        //Update source
+                        source.Update(getTimeMS(),cloned->GetSeqNum(),len);
+                }
 
 		//Check if we are using transport wide for this packet
 		if (cloned->HasTransportWideCC())
@@ -1837,9 +1943,17 @@ int DTLSICETransport::Send(const RTPPacket::shared& packet)
 	//Do we need to send probing?
 	if (probe && group->type == MediaFrame::Video && cloned->GetMark() && source.remb)
 	{
-		//Get bitrates
-		DWORD bitrate   = static_cast<DWORD>(source.acumulator.GetInstantAvg());
-		DWORD estimated = source.remb;
+                DWORD bitrate   = 0;
+		DWORD estimated = 0;
+		
+                //SYNCHRONIZED
+                {
+                        //Lock in scope
+                        ScopedLock scope(source);
+                        //Get bitrates
+                        bitrate   = static_cast<DWORD>(source.acumulator.GetInstantAvg());
+                        estimated = source.remb;
+                }
 		
 					
 		//If we can still send more
@@ -1849,9 +1963,9 @@ int DTLSICETransport::Send(const RTPPacket::shared& packet)
 			//Get probe padding needed
 			DWORD probingBitrate = maxProbingBitrate ? std::min(estimated-bitrate,maxProbingBitrate) : estimated-bitrate;
 
-			//Get number of probes assuming 30 fps not send more than 5 continous packets
-			WORD num = (probingBitrate*33)/(8000*size);
-
+			//Get number of probes, do not send more than 32 continoues packets (~aprox 2mpbs)
+			BYTE num = std::min<QWORD>((probingBitrate*33)/(8000*size),32);
+			
 			//UltraDebug("-DTLSICETransport::Run() | Sending inband probing packets [at:%u,estimated:%u,bitrate:%u,probing:%u,max:%u,num:%d]\n", cloned->GetSeqNum(), estimated, bitrate,probingBitrate,maxProbingBitrate, num, sleep);
 			
 			//Set all the probes
@@ -2140,6 +2254,10 @@ void DTLSICETransport::onRTCP(const RTCPCompoundPacket::shared& rtcp)
 								//For each
 								for (DWORD i=0;i<num;++i)
 								{
+									//Check length
+									if (len<8+4*i+4)
+										//wrong format
+										break;
 									//Get ssrc
 									DWORD target = get4(payload,8+4*i);
 									//Get media
@@ -2392,8 +2510,8 @@ int DTLSICETransport::Run()
 					//Get probe padding needed
 					DWORD probingBitrate = maxProbingBitrate ? std::min(estimated-bitrate,maxProbingBitrate) : estimated-bitrate;
 
-					//Get number of probes, do not send more than 5 continoues packets
-					WORD num = (probingBitrate*sleep)/(8000*size);
+					//Get number of probes, do not send more than 32 continoues packets (~aprox 2mpbs)
+					BYTE num = std::min<QWORD>((probingBitrate*sleep)/(8000*size),32);
 
 					//Check if we have an outgpoing group
 					for (auto &group : outgoing)
